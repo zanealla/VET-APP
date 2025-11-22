@@ -1,0 +1,13 @@
+{
+  "name": "veterinary-app",
+  "version": "1.0.0",
+  "description": "Veterinary medicines manager (Express + JSON file + PDF export)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "pdfkit": "^0.13.0"
+  }
+}
