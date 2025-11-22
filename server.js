@@ -27,27 +27,91 @@ app.use('/app1', express.static(path.join(__dirname, 'app1', 'public')));
 app.use('/app2', express.static(path.join(__dirname, 'app2', 'public')));
 app.use('/shared', express.static(path.join(__dirname, 'shared')));
 
-// Database configuration
-const DB_PATH = path.join(__dirname, 'app1', 'invoice_app.db');
+// ======================================================
+// 💾 PERSISTENCE CONFIGURATION (Railway Volume Support)
+// ======================================================
 
-// Shared files paths
-const sharedDir = path.join(__dirname, 'shared');
-const medicinesFile = path.join(sharedDir, 'medicines.json');
-const categoriesFile = path.join(sharedDir, 'categories.json');
+// Define the volume path (Railway uses /data, or we use local storage folder)
+// We check if '/data' exists to determine if we are in the cloud environment
+const RAILWAY_VOLUME_PATH = '/data';
+const isRailway = fs.existsSync(RAILWAY_VOLUME_PATH);
 
-console.log(`📁 Database path: ${DB_PATH}`);
-console.log(`📁 Shared medicines path: ${medicinesFile}`);
+// Set the data directory
+const DATA_DIR = isRailway ? RAILWAY_VOLUME_PATH : path.join(__dirname, 'storage_local');
 
-// Create shared directory if it doesn't exist
-if (!fs.existsSync(sharedDir)) {
-  fs.mkdirSync(sharedDir, { recursive: true });
+// 1. Create the data directory if it doesn't exist
+if (!fs.existsSync(DATA_DIR)) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    console.log(`📁 Created storage directory: ${DATA_DIR}`);
+  } catch (err) {
+    console.error(`❌ Error creating storage directory: ${err.message}`);
+  }
 }
+
+// 2. Define paths for the LIVE data (in the volume)
+const DB_PATH = path.join(DATA_DIR, 'invoice_app.db');
+const medicinesFile = path.join(DATA_DIR, 'medicines.json');
+const categoriesFile = path.join(DATA_DIR, 'categories.json');
+
+console.log(`⚙️  Environment: ${isRailway ? 'Railway Volume' : 'Local Storage'}`);
+console.log(`📁 Live Database: ${DB_PATH}`);
+console.log(`📁 Live Medicines: ${medicinesFile}`);
+
+// 3. INITIALIZATION: Copy files from Source Code -> Volume (if they don't exist in volume)
+function initializePersistence() {
+    // --- Database ---
+    if (!fs.existsSync(DB_PATH)) {
+        console.log('⚠️ DB not found in volume. initializing...');
+        const sourceDb = path.join(__dirname, 'app1', 'invoice_app.db');
+        if (fs.existsSync(sourceDb)) {
+            fs.copyFileSync(sourceDb, DB_PATH);
+            console.log('✅ Copied existing invoice_app.db to volume');
+        } else {
+            console.log('ℹ️ No source DB found. SQLite will create a new one on first write.');
+        }
+    }
+
+    // --- Medicines ---
+    if (!fs.existsSync(medicinesFile)) {
+        console.log('⚠️ Medicines file not found in volume. initializing...');
+        const sourceMed = path.join(__dirname, 'shared', 'medicines.json');
+        if (fs.existsSync(sourceMed)) {
+            fs.copyFileSync(sourceMed, medicinesFile);
+            console.log('✅ Copied existing medicines.json to volume');
+        } else {
+            fs.writeFileSync(medicinesFile, '[]');
+            console.log('✅ Created empty medicines.json in volume');
+        }
+    }
+
+    // --- Categories ---
+    if (!fs.existsSync(categoriesFile)) {
+        console.log('⚠️ Categories file not found in volume. initializing...');
+        const sourceCat = path.join(__dirname, 'shared', 'categories.json');
+        if (fs.existsSync(sourceCat)) {
+            fs.copyFileSync(sourceCat, categoriesFile);
+            console.log('✅ Copied existing categories.json to volume');
+        } else {
+            const defaults = ['Antiparasitaire', 'Antibiotique', 'Vitamine', 'Anti-inflammatoire', 'Vaccin', 'Désinfectant', 'Consumables'];
+            fs.writeFileSync(categoriesFile, JSON.stringify(defaults));
+            console.log('✅ Created default categories.json in volume');
+        }
+    }
+}
+
+// Run initialization
+initializePersistence();
+
+// ======================================================
+// 🔌 Database Helpers
+// ======================================================
 
 // Helper function to get database connection
 function getDb() {
-  return new sqlite3.Database(DB_PATH, sqlite3.OPEN_READWRITE, (err) => {
+  return new sqlite3.Database(DB_PATH, sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE, (err) => {
     if (err) {
-      console.error('Error opening database:', err.message);
+      console.error('❌ Error opening database:', err.message);
     }
   });
 }
@@ -80,6 +144,7 @@ app.get('/', (req, res) => {
                 font-size: 18px;
             }
             .app-link:hover { background: #0056b3; }
+            .footer { margin-top: 30px; font-size: 12px; color: #666; }
         </style>
     </head>
     <body>
@@ -88,6 +153,7 @@ app.get('/', (req, res) => {
             <p>Choose an application to use:</p>
             <a href="/app1" class="app-link">📊 Invoice Management App</a>
             <a href="/app2" class="app-link">💊 Veterinary Medicines App</a>
+            <div class="footer">Storage Mode: ${isRailway ? 'Persistent Volume (/data)' : 'Local Storage'}</div>
         </div>
     </body>
     </html>
@@ -110,32 +176,42 @@ app.get('/api/stats/overview', (req, res) => {
   
   db.serialize(() => {
     try {
+      // Ensure table exists (safety check for fresh install)
+      db.run("CREATE TABLE IF NOT EXISTS invoices (id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, client_id INTEGER, number TEXT, date TEXT, subtotal REAL, tax_total REAL, total REAL, paid INTEGER DEFAULT 0)", (err) => {
+          if(err) console.log("Table check error (harmless if exists):", err.message);
+      });
+
       // Total invoices
       db.get("SELECT COUNT(*) as total FROM invoices", (err, row) => {
         if (err) {
+           // If tables don't exist yet, return 0s instead of crashing
+           if(err.message.includes('no such table')) {
+               res.json({ total_invoices: 0, total_clients: 0, total_companies: 0, total_revenue: 0, paid_invoices: 0, unpaid_invoices: 0, recent_invoices: 0 });
+               return;
+           }
           res.status(500).json({ error: `Error fetching stats: ${err.message}` });
           return;
         }
-        const totalInvoices = row.total;
+        const totalInvoices = row ? row.total : 0;
 
         // Total clients
         db.get("SELECT COUNT(*) as total FROM clients", (err, row) => {
-          const totalClients = row.total;
+          const totalClients = row ? row.total : 0;
 
           // Total companies
           db.get("SELECT COUNT(*) as total FROM companies", (err, row) => {
-            const totalCompanies = row.total;
+            const totalCompanies = row ? row.total : 0;
 
             // Total revenue
             db.get("SELECT COALESCE(SUM(total), 0) as total FROM invoices", (err, row) => {
-              const totalRevenue = row.total;
+              const totalRevenue = row ? row.total : 0;
 
               // Paid vs Unpaid invoices
               db.get("SELECT COUNT(*) as count FROM invoices WHERE paid = 1", (err, row) => {
-                const paidInvoices = row.count;
+                const paidInvoices = row ? row.count : 0;
 
                 db.get("SELECT COUNT(*) as count FROM invoices WHERE paid = 0", (err, row) => {
-                  const unpaidInvoices = row.count;
+                  const unpaidInvoices = row ? row.count : 0;
 
                   // Recent invoices (last 30 days)
                   const thirtyDaysAgo = new Date();
@@ -143,7 +219,7 @@ app.get('/api/stats/overview', (req, res) => {
                   const dateStr = thirtyDaysAgo.toISOString().split('T')[0];
 
                   db.get("SELECT COUNT(*) as count FROM invoices WHERE date >= ?", [dateStr], (err, row) => {
-                    const recentInvoices = row.count;
+                    const recentInvoices = row ? row.count : 0;
 
                     res.json({
                       total_invoices: totalInvoices,
@@ -165,7 +241,7 @@ app.get('/api/stats/overview', (req, res) => {
       });
     } catch (error) {
       res.status(500).json({ error: `Error fetching stats: ${error.message}` });
-      db.close();
+      try { db.close(); } catch(e) {}
     }
   });
 });
@@ -183,6 +259,11 @@ app.get('/api/stats/payment-stats', (req, res) => {
     FROM invoices
   `, (err, stats) => {
     if (err) {
+      if(err.message.includes('no such table')) {
+          res.json({ paid_count: 0, unpaid_count: 0, total_count: 0, paid_amount: 0, unpaid_amount: 0, paid_percentage: 0 });
+          db.close();
+          return;
+      }
       res.status(500).json({ error: `Error fetching payment stats: ${err.message}` });
       db.close();
       return;
@@ -454,7 +535,7 @@ app.get('/api/invoices', (req, res) => {
   });
 });
 
-// GET single invoice by ID - THIS IS THE MISSING ENDPOINT!
+// GET single invoice by ID
 app.get('/api/invoices/:id', (req, res) => {
   const db = getDb();
   const invoiceId = req.params.id;
@@ -772,15 +853,6 @@ const writeCategories = (categories) => {
   }
 };
 
-// Initialize shared files if they don't exist
-if (!fs.existsSync(medicinesFile)) {
-  writeMedicines([]);
-}
-
-if (!fs.existsSync(categoriesFile)) {
-  writeCategories(readCategories());
-}
-
 // Categories routes
 app.get("/api/categories", (req, res) => {
   const categories = readCategories();
@@ -920,5 +992,4 @@ app.listen(PORT, () => {
   console.log(`🚀 Combined server running on http://localhost:${PORT}`);
   console.log(`📊 Invoice App: http://localhost:${PORT}/app1`);
   console.log(`💊 Medicines App: http://localhost:${PORT}/app2`);
-  console.log(`📁 Using database: ${DB_PATH}`);
 });
